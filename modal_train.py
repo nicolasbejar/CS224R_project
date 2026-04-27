@@ -20,9 +20,11 @@ import modal
 
 
 LOCAL_PROJECT_ROOT = Path(__file__).resolve().parent
-REMOTE_PROJECT_ROOT = Path("/root/default_proj")
-REMOTE_VOLUME_ROOT = Path("/vol")
-REMOTE_REQUIREMENTS_PATH = REMOTE_PROJECT_ROOT / "modal_requirements.txt"
+REMOTE_PROJECT_ROOT_STR = "/root/default_proj"
+REMOTE_PROJECT_ROOT = Path(REMOTE_PROJECT_ROOT_STR)
+REMOTE_VOLUME_ROOT_STR = "/vol"
+REMOTE_VOLUME_ROOT = Path(REMOTE_VOLUME_ROOT_STR)
+REMOTE_REQUIREMENTS_PATH_STR = REMOTE_PROJECT_ROOT_STR + "/modal_requirements.txt"
 
 APP_NAME = os.environ.get("MODAL_APP_NAME", "default-proj-training")
 GPU_CONFIG = os.environ.get("MODAL_GPU", "H100!")
@@ -59,20 +61,20 @@ def _build_secret_list() -> list[modal.Secret]:
 
 base_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .add_local_dir(str(LOCAL_PROJECT_ROOT), remote_path=str(REMOTE_PROJECT_ROOT), copy=True)
+    .add_local_dir(str(LOCAL_PROJECT_ROOT), remote_path=REMOTE_PROJECT_ROOT_STR, copy=True)
     .run_commands(
         (
-            f"cd {shlex.quote(str(REMOTE_PROJECT_ROOT))} && "
+            f"cd {shlex.quote(REMOTE_PROJECT_ROOT_STR)} && "
             "python -m pip install --upgrade "
             "pip==25.3 setuptools==80.10.2 wheel==0.46.3"
         ),
         (
-            f"cd {shlex.quote(str(REMOTE_PROJECT_ROOT))} && "
+            f"cd {shlex.quote(REMOTE_PROJECT_ROOT_STR)} && "
             "python -m pip install "
             f"--extra-index-url {shlex.quote(PIP_EXTRA_INDEX_URL)} "
-            f"-r {shlex.quote(str(REMOTE_REQUIREMENTS_PATH))}"
+            f"-r {shlex.quote(REMOTE_REQUIREMENTS_PATH_STR)}"
         ),
-        f"cd {shlex.quote(str(REMOTE_PROJECT_ROOT))} && python -m pip install --no-deps -e .",
+        f"cd {shlex.quote(REMOTE_PROJECT_ROOT_STR)} && python -m pip install --no-deps -e .",
     )
 )
 
@@ -146,7 +148,7 @@ def _run_eval(eval_args: list[str]) -> str:
     cpu=CPU_COUNT,
     timeout=TIMEOUT_SECONDS,
     startup_timeout=STARTUP_TIMEOUT_SECONDS,
-    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    volumes={REMOTE_VOLUME_ROOT_STR: TRAINING_VOLUME},
     secrets=_build_secret_list(),
 )
 def run_sft(trainer_args: list[str]) -> str:
@@ -159,7 +161,7 @@ def run_sft(trainer_args: list[str]) -> str:
     cpu=CPU_COUNT,
     timeout=TIMEOUT_SECONDS,
     startup_timeout=STARTUP_TIMEOUT_SECONDS,
-    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    volumes={REMOTE_VOLUME_ROOT_STR: TRAINING_VOLUME},
     secrets=_build_secret_list(),
 )
 def run_ipo(trainer_args: list[str]) -> str:
@@ -172,7 +174,7 @@ def run_ipo(trainer_args: list[str]) -> str:
     cpu=CPU_COUNT,
     timeout=TIMEOUT_SECONDS,
     startup_timeout=STARTUP_TIMEOUT_SECONDS,
-    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    volumes={REMOTE_VOLUME_ROOT_STR: TRAINING_VOLUME},
     secrets=_build_secret_list(),
 )
 def run_rloo(trainer_args: list[str]) -> str:
@@ -185,7 +187,7 @@ def run_rloo(trainer_args: list[str]) -> str:
     cpu=CPU_COUNT,
     timeout=TIMEOUT_SECONDS,
     startup_timeout=STARTUP_TIMEOUT_SECONDS,
-    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    volumes={REMOTE_VOLUME_ROOT_STR: TRAINING_VOLUME},
     secrets=_build_secret_list(),
 )
 def run_eval(eval_args: list[str]) -> str:

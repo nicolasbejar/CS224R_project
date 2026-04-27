@@ -1,0 +1,54 @@
+% CS224R project proposal
+\documentclass{article}
+
+\usepackage[preprint]{cs224r_2025}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{fancyhdr}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{CS224R Project Proposal}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\renewcommand{\maketitle}{
+  \begin{center}
+    {\bf \large Off-Policy RLOO: Reusing Rollouts for Sample-Efficient RL Fine-Tuning of LLMs}\\
+    \vspace{0.1cm}
+    {\bf Team Members:} Nicolas Bejar\\
+    \vspace{0.1cm}
+    {\bf Emails:} nbejar@stanford.edu\\
+    \vspace{0.2cm}
+  \end{center}
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Objective}
+On-policy policy-gradient methods such as RLOO~\cite{rloo} and PPO~\cite{ppo} dominate modern RL fine-tuning of LLMs, but they require a fresh round of vLLM rollouts before every gradient update. On the Countdown reasoning task with Qwen2.5-0.5B, sampling consumes the majority of wall-clock time per training step, while each rollout is used only once. We propose to extend the default RLOO pipeline with controlled \emph{off-policy reuse}: each batch of sampled trajectories is used for $K{>}1$ gradient mini-epochs with importance-weight correction, KL regularization to a frozen reference, and clipping for stability. The objective is to characterize the trade-off between sample efficiency (wall-clock to a target Countdown accuracy and final pass@k) and policy drift (importance-weight variance, KL, entropy collapse), and to identify configurations where reuse strictly Pareto-dominates strict on-policy RLOO.
+
+\section{Related Work}
+\textbf{On-policy RL for LLMs.} REINFORCE Leave-One-Out~\cite{rloo} establishes a low-variance baseline for policy-gradient updates by averaging rewards within a sampled group, and is the algorithm we extend. PPO~\cite{ppo} introduces a clipped surrogate objective that already permits a small amount of off-policy reuse, but in current LLM pipelines $K$ is rarely tuned beyond 1--2 epochs and its interaction with sampling cost is seldom characterized. \textbf{Preference-based fine-tuning.} DPO~\cite{dpo} and IPO~\cite{ipo} avoid online sampling by reparameterizing the reward model through the policy log-likelihood, but they cannot exploit a verifiable reward signal such as the Countdown grader. \textbf{Off-policy RL for reasoning LLMs.} Tang et al.~\cite{tang2025singlealg} unify on- and off-policy fine-tuning under a single algorithm and report substantial sample-efficiency gains; Bartoldson et al.~\cite{tba} decouple sampling from learning entirely via asynchronous trajectory balance. Trajectory Bellman Residual Minimization~\cite{tbrm} pushes further by replacing policy gradients with a value-based objective amenable to replay. These works mostly study large-scale settings ($\geq$7B parameters) and complex objectives; the gap we address is whether the much simpler RLOO baseline already benefits from rollout reuse on a small, verifier-driven reasoning task, and which of \{$K$, importance-weight clip, KL coefficient\} matter most for stability.
+
+\section{Technical Outline}
+\textbf{Approach.} Starting from the default RLOO orchestration in \texttt{rloo\_trainer/rloo.py} and the importance-weight hook already exposed by \texttt{rloo\_update\_worker.update}, we modify the trainer to cache each tokenized rollout batch together with its vLLM \texttt{sample\_log\_probs} and to call the update worker $K$ times per sampling round. The first inner update is on-policy ($w{=}1$); subsequent updates use the per-sequence importance weight $w(y,x){=}\exp\bigl(\log\pi_\theta(y\mid x)-\log\mu(y\mid x)\bigr)$ clipped to $[1/c,c]$, multiplying the leave-one-out advantage. We add (i) a KL-to-reference penalty against the SFT checkpoint to bound drift~\cite{rlhf} and (ii) an entropy bonus, both already plumbed into the worker. \textbf{Novel contribution.} A controlled study of rollout reuse for verifier-driven RLOO: we run a $K{\in}\{1,2,4,8\}\times c{\in}\{2,5,\infty\}$ grid at fixed total compute and report (a) wall-clock to first reach 0.50 average Countdown score, (b) final pass@k for $k{\in}\{1,4,16,32\}$, (c) importance-weight mean and variance, and (d) KL/entropy trajectories. \textbf{Evaluation plan.} Baselines: Qwen2.5-0.5B base, our SFT checkpoint, IPO checkpoint, and strict on-policy RLOO ($K{=}1$). All evaluations use the verifier in \texttt{evaluation/countdown.py} on \texttt{asingh15/countdown\_tasks\_3to4} with the eval sampling parameters specified in the project guidelines (T$=$0.6, top-$p$$=$0.95, top-$k$$=$20). The pass@k analysis uses 32 samples per prompt and the unbiased estimator from \texttt{evaluation/view\_passk.ipynb}. Training tracked in W\&B; final ablation table and pass@k curve will be the central plots in the milestone and final reports.
+
+\section{Team Contributions}
+\begin{itemize}
+    \item \textbf{Nicolas Bejar (solo team)}: implementation of the SFT, IPO, and on-policy RLOO baselines; design and implementation of the off-policy RLOO extension (rollout caching, $K$-epoch loop, importance-weight clipping, KL/entropy ablations); evaluation pipeline, pass@k analysis, and final write-up.
+\end{itemize}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{reference}
+
+\end{document}
