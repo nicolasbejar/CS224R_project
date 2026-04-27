@@ -77,6 +77,113 @@ def train(
     gradient_accumulation_steps=1, 
     gradient_clipping=1.0
 ):
+    model.to(device)
+    total_steps = 0
+    
+    for epoch in range( num_epochs ): 
+        
+        model.train()
+        total_loss  = 0.0 
+        
+        tqdm_bar = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch+1}")
+
+        for (step, batch) in enumerate( tqdm_bar) :
+            
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            is_response_token = batch["is_response_token"].to(device)
+
+            outputs = model( input_ids = input_ids, attention_mask = attention_mask)
+            
+            logits = outputs.logits   # check size here batch, len, vocab 
+            
+            # shift for next token prediction 
+            
+            
+            sh_labels = input_ids[ :, 1:].contiguous()        # shift by 1
+            sh_mask   = is_response_token[:,1:].contiguous()  # same 
+            sh_logits = logits[ :, :-1,:].contiguous()  # chop the last one in time seq 
+              
+            log_probs = F.log_softmax(sh_logits, dim=-1)
+            token_log_probs = log_probs.gather(-1, sh_labels.unsqueeze(-1)).squeeze(-1)                                
+                
+            loss = - (token_log_probs * sh_mask).sum()/ max(sh_mask.sum(),1)
+            
+            loss = loss /gradient_accumulation_steps
+            
+            loss.backward()
+            
+            # when we accumulate enough  do the step 
+            
+            if (step+1) % gradient_accumulation_steps == 0 : 
+                
+                if gradient_clipping is not None : 
+                    torch.nn.utils.clip_grad_norm_( model.parameters(), gradient_clipping)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                optimizer.zero_grad()
+                
+                total_steps += 1 
+                
+                wandb.log({"train/loss": loss.item() * gradient_accumulation_steps,
+                           "lr": scheduler.get_last_lr()[0],
+                           "steps": total_steps         })
+            total_loss += loss.item()
+            tqdm_bar.set_postfix({"loss": loss.item()})   
+        
+        # end of step 3 
+        
+        # evaluate and log metrics to wandb
+        
+        model.eval()
+        eval_loss = 0.0
+        eval_steps = 0
+        
+        with torch.no_grad(): 
+            for batch in test_dataloader : 
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                is_response_token = batch["is_response_token"].to(device)
+
+                outputs = model( input_ids = input_ids, attention_mask = attention_mask)
+                
+                logits = outputs.logits   # check size here batch, len, vocab 
+                
+                # shift for next token prediction 
+                
+                
+                sh_labels = input_ids[ :, 1:].contiguous()        # shift by 1
+                sh_mask   = is_response_token[:,1:].contiguous()  # same 
+                sh_logits = logits[ :, :-1,:].contiguous()  # chop the last one in time seq 
+                
+                log_probs = F.log_softmax(sh_logits, dim=-1)
+                token_log_probs = log_probs.gather(-1, sh_labels.unsqueeze(-1)).squeeze(-1)                                
+                    
+                loss = - (token_log_probs * sh_mask).sum()/ max(sh_mask.sum(),1)
+                eval_loss += loss.item()
+                
+                eval_steps += 1 
+        
+        avg_eval_loss = eval_loss / max( eval_steps,1 )
+        
+        
+        wandb.log({"eval/loss": avg_eval_loss, "epoch": epoch })
+                
+        print(f"Epoch {epoch+1} eval loss: {avg_eval_loss:.4f}")
+        
+        if save_model:
+            save_checkpoint(
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                os.path.join(output_dir, f"epoch_{epoch+1}")
+            )
+
+        clear_cache(model)
+
     # TODO(student): implement the SFT optimization loop.
     # Expected high-level flow:
     # 1) Forward pass on `input_ids` and compute token-level log-probs.
@@ -84,7 +191,7 @@ def train(
     # 3) Backprop, optionally clip gradients, then optimizer/scheduler steps.
     # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
     # 5) Save checkpoints under `output_dir` when requested.
-    raise NotImplementedError("SFT is not implemented for the student project")
+    
 
 def main():
     parser = argparse.ArgumentParser()
