@@ -1,55 +1,59 @@
-"""High-level RLOO training orchestration.
+"""High-level MaxRL training orchestration.
 
-This script alternates between:
-1) sampling responses with vLLM (SamplingWorker), and
-2) updating policy weights with PyTorch (RLOOUpdateWorker).
+This is structurally identical to `rloo_trainer/rloo.py` (alternating vLLM
+sampling and PyTorch updates). The only methodological change is that the
+update worker implements the MaxRL (log p_theta) objective instead of REINFORCE
+with a leave-one-out baseline. Sampling, reward computation, tokenization, and
+checkpointing are reused as-is.
 """
 
 import os
+import shutil
+import sys
 import warnings
+from argparse import ArgumentParser
+from pathlib import Path
+
+import numpy as np
+import random
 import ray
 import torch
+import wandb
 from transformers import AutoTokenizer
-import random
-import sys
-from pathlib import Path
+
 warnings.filterwarnings("ignore")
-import tempfile
 
 # Make sibling packages (e.g., evaluation/) importable when this file is run as
-# `python rloo_trainer/rloo.py`.
+# `python maxrl_trainer/maxrl.py`.
 PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from evaluation.countdown import compute_score
-import numpy as np
+# Sampling + dataset are identical to RLOO, so reuse directly.
 from rloo_trainer.sampling_worker import SamplingWorker
-from rloo_trainer.rloo_update_worker import RLOOUpdateWorker
 from rloo_trainer.rloo_dataset import get_dataloaders
-import wandb
-from argparse import ArgumentParser
-import uuid
-import shutil
-# os.environ['WANDB_MODE'] = 'offline'
+from maxrl_trainer.maxrl_update_worker import MaxRLUpdateWorker
 
-class RLOOTrainer:
-    """Coordinates online sampling, reward computation, and policy updates."""
+
+class MaxRLTrainer:
+    """Coordinates online sampling, reward computation, and MaxRL updates."""
+
     def __init__(
-        self, 
+        self,
         model_name='asingh15/qwen-sft-countdown-defaultproj',
         ref_model_name=None,
         tokenizer_name=None,
         dataset_name='asingh15/countdown_tasks_3to4',
-        wandb_project='rloo_default_project',
+        wandb_project='maxrl_default_project',
         wandb_name='test',
         lr_schedule='constant',
         learning_rate=1e-5,
-        warmup_ratio=0.05,
+        warmup_ratio=0.0,
         weight_decay=0.01,
         batch_size=4,
-        group_size=2, 
-        entropy_coefficient=0.01, 
+        group_size=8,
+        entropy_coefficient=0.01,
         kl_divergence_coefficient=0.0,
         num_epochs=10,
         gradient_accumulation_steps=1,
@@ -67,9 +71,10 @@ class RLOOTrainer:
         num_training_steps=250,
         max_table_rows=20,
         save_every_n_steps=-1,
-        save_dir='checkpoints/rloo_checkpoints',
+        save_dir='checkpoints/maxrl_checkpoints',
         ppo_epochs=1,
         importance_weight_clip=5.0,
+        success_threshold=0.5,
     ):
         self.model_name = model_name
         self.ref_model_name = self.model_name if ref_model_name is None else ref_model_name
@@ -104,34 +109,31 @@ class RLOOTrainer:
         self.max_table_rows = max_table_rows
         self.save_every_n_steps = save_every_n_steps
         self.save_dir = save_dir
-        # Off-policy extension: reuse each sampled rollout batch for K updates.
         self.ppo_epochs = max(1, int(ppo_epochs))
         self.importance_weight_clip = float(importance_weight_clip)
-        
-        # DataLoader yields prompts + ground-truth metadata only.
+        self.success_threshold = float(success_threshold)
+
         dataloaders = get_dataloaders(
-            self.dataset_name, 
-            splits=['train', 'test'], 
-            batch_size=self.batch_size, 
+            self.dataset_name,
+            splits=['train', 'test'],
+            batch_size=self.batch_size,
             num_proc=4,
         )
         self.train_dataloader, self.test_dataloader = dataloaders['train'], dataloaders['test']
-        
-        # Initialize actor references as None - will be created on demand
+
         self.sampling_worker = None
         self.update_worker = None
-        
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
 
         self.wandb = wandb.init(project=self.wandb_project, name=self.wandb_name)
         self.wandb.config.update(vars(self))
 
     def _create_sampling_worker(self, model_path):
-        """Create a new sampling worker, killing any existing update worker first."""
         if self.update_worker is not None:
             ray.kill(self.update_worker)
             self.update_worker = None
-        
+
         self.sampling_worker = SamplingWorker.remote(
             model_path=model_path,
             max_model_len=self.max_model_len,
@@ -144,18 +146,17 @@ class RLOOTrainer:
             top_k=self.top_k,
             min_p=self.min_p,
             max_tokens=self.max_tokens,
-            group_size=self.group_size
+            group_size=self.group_size,
         )
         ray.get(self.sampling_worker.load_checkpoint.remote())
         return self.sampling_worker
 
     def _create_update_worker(self, model_path, optimizer_path, scheduler_path):
-        """Create a new update worker, killing any existing sampling worker first."""
         if self.sampling_worker is not None:
             ray.kill(self.sampling_worker)
             self.sampling_worker = None
-        
-        self.update_worker = RLOOUpdateWorker.remote(
+
+        self.update_worker = MaxRLUpdateWorker.remote(
             model_path=model_path,
             ref_model_path=self.ref_model_name,
             optimizer_path=optimizer_path,
@@ -172,12 +173,12 @@ class RLOOTrainer:
             warmup_ratio=self.warmup_ratio,
             num_training_steps=self.num_training_steps,
             importance_weight_clip=self.importance_weight_clip,
+            success_threshold=self.success_threshold,
         )
         ray.get(self.update_worker.load_checkpoint.remote())
         return self.update_worker
 
     def _build_generation_table(self, prompts, responses, rewards):
-        """Create a lightweight W&B table of sampled generations."""
         if self.max_table_rows <= 0:
             return None
 
@@ -198,13 +199,11 @@ class RLOOTrainer:
         return table
 
     def tokenize_batch(self, batch):
-        """Tokenize prompt/response rollouts into arrays for policy update worker."""
-        all_prompts = batch['prompt'] # batch
-        all_responses = batch['response'] # batch x group_size
-        all_rewards = batch['rewards'] # batch x group_size
-        all_sample_log_probs = batch['sample_log_probs'] # batch x group_size
+        all_prompts = batch['prompt']
+        all_responses = batch['response']
+        all_rewards = batch['rewards']
+        all_sample_log_probs = batch['sample_log_probs']
 
-        # Flatten prompt-major grouped outputs into row-aligned training examples.
         all_prompts_repeated = [item for item in all_prompts for _ in range(self.group_size)]
         all_responses_flattened = [item for sublist in all_responses for item in sublist]
         all_rewards_flattened = [item for sublist in all_rewards for item in sublist]
@@ -214,25 +213,37 @@ class RLOOTrainer:
             == len(all_responses_flattened)
             == len(all_rewards_flattened)
             == len(all_sample_log_probs_flattened)
-        ), (
-            f"len(all_prompts_repeated) = {len(all_prompts_repeated)}, "
-            f"len(all_responses_flattened) = {len(all_responses_flattened)}, "
-            f"len(all_rewards_flattened) = {len(all_rewards_flattened)}, "
-            f"len(all_sample_log_probs_flattened) = {len(all_sample_log_probs_flattened)}"
         )
 
-        # Left-pad prompts and right-pad responses before concatenation.
         self.tokenizer.padding_side = "left"
-        tokenized_prompts = self.tokenizer(all_prompts_repeated, add_special_tokens=False, padding=True, truncation=True, max_length=self.max_prompt_length, return_tensors="np")
+        tokenized_prompts = self.tokenizer(
+            all_prompts_repeated,
+            add_special_tokens=False,
+            padding=True,
+            truncation=True,
+            max_length=self.max_prompt_length,
+            return_tensors="np",
+        )
         self.tokenizer.padding_side = "right"
-        tokenized_responses = self.tokenizer(all_responses_flattened, add_special_tokens=False, padding=True, truncation=True, max_length=self.max_response_length, return_tensors="np")
+        tokenized_responses = self.tokenizer(
+            all_responses_flattened,
+            add_special_tokens=False,
+            padding=True,
+            truncation=True,
+            max_length=self.max_response_length,
+            return_tensors="np",
+        )
 
-        prompt_input_ids, prompt_attention_mask = tokenized_prompts["input_ids"], tokenized_prompts["attention_mask"]
-        response_input_ids, response_attention_mask = tokenized_responses["input_ids"], tokenized_responses["attention_mask"]
-        is_response_token = np.concatenate([np.zeros_like(prompt_input_ids), np.ones_like(response_input_ids)], axis=1) # 0 for prompt tokens, 1 for response tokens
+        prompt_input_ids = tokenized_prompts["input_ids"]
+        prompt_attention_mask = tokenized_prompts["attention_mask"]
+        response_input_ids = tokenized_responses["input_ids"]
+        response_attention_mask = tokenized_responses["attention_mask"]
+        is_response_token = np.concatenate(
+            [np.zeros_like(prompt_input_ids), np.ones_like(response_input_ids)], axis=1
+        )
         input_ids = np.concatenate([prompt_input_ids, response_input_ids], axis=1)
         attention_mask = np.concatenate([prompt_attention_mask, response_attention_mask], axis=1)
-        
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -242,78 +253,66 @@ class RLOOTrainer:
         }
 
     def train(self):
-        """Run online RLOO training for `num_training_steps` updates."""
         last_checkpoint_dir = None
         global_step = 0
         for epoch in range(self.num_epochs):
-            if global_step > 0 and global_step == self.num_training_steps: break
+            if global_step > 0 and global_step == self.num_training_steps:
+                break
             for train_iter, batch in enumerate(self.train_dataloader):
-                if global_step > 0 and global_step == self.num_training_steps: break
-                # 1) Sample `group_size` responses per prompt with current policy.
-                ### SAMPLE ###
-                print(f"Sampling from model, Epoch {epoch}, Global Step {global_step}")
-                model_path = self.model_name if last_checkpoint_dir is None else os.path.join(last_checkpoint_dir, "model")
-                
+                if global_step > 0 and global_step == self.num_training_steps:
+                    break
+
+                # 1) Sample group_size responses per prompt with current policy.
+                print(f"Sampling, Epoch {epoch}, Global Step {global_step}")
+                model_path = (
+                    self.model_name if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "model")
+                )
                 self._create_sampling_worker(model_path)
 
                 all_prompts = batch['prompt']
                 all_ground_truth = batch['ground_truth']
-                assert len(all_prompts) == len(all_ground_truth) == self.batch_size, f"len(all_prompts) = {len(all_prompts)}, len(all_ground_truth) = {len(all_ground_truth)}, self.batch_size = {self.batch_size}"
-                all_responses, all_sample_log_probs = ray.get(self.sampling_worker.generate.remote(all_prompts))
+                assert len(all_prompts) == len(all_ground_truth) == self.batch_size
+                all_responses, all_sample_log_probs = ray.get(
+                    self.sampling_worker.generate.remote(all_prompts)
+                )
 
-                assert len(all_responses) == self.batch_size, f"len(all_responses) = {len(all_responses)}, self.batch_size = {self.batch_size}"
-                assert len(all_sample_log_probs) == self.batch_size, f"len(all_sample_log_probs) = {len(all_sample_log_probs)}, self.batch_size = {self.batch_size}"
-                for i in range(self.batch_size):
-                    assert len(all_responses[i]) == self.group_size, f"len(all_responses[i]) = {len(all_responses[i])}, self.group_size = {self.group_size}"
-                    assert len(all_sample_log_probs[i]) == self.group_size, f"len(all_sample_log_probs[i]) = {len(all_sample_log_probs[i])}, self.group_size = {self.group_size}"
-                    for j in range(self.group_size):
-                        assert isinstance(all_responses[i][j], str), f"all_responses[i][j] = {all_responses[i][j]}"
-                        assert isinstance(all_sample_log_probs[i][j], (float, np.floating, int, np.integer)), (
-                            f"all_sample_log_probs[i][j] = {all_sample_log_probs[i][j]}"
-                        )
-
-                print(f"Computing rewards, Epoch {epoch}, Global Step {global_step}")
-                
                 # 2) Score sampled responses against task ground truth.
-                ### COMPUTE REWARDS ###
+                print(f"Computing rewards, Epoch {epoch}, Global Step {global_step}")
                 all_rewards = []
                 for curr_responses, curr_ground_truth in zip(all_responses, all_ground_truth):
-                    curr_rewards = []
-                    for x in curr_responses:
-                        curr_rewards.append(compute_score(x, curr_ground_truth))
-                    all_rewards.append(curr_rewards)
-                reward_mean = np.mean(all_rewards).item()
-                print('Reward Mean: ', reward_mean)
+                    all_rewards.append([compute_score(x, curr_ground_truth) for x in curr_responses])
+                reward_mean = float(np.mean(all_rewards).item())
+                # Empirical per-prompt success rate p_hat = mean(1[r > thr]) over the group.
+                p_hat_per_prompt = [
+                    float(np.mean([1.0 if r > self.success_threshold else 0.0 for r in rs]))
+                    for rs in all_rewards
+                ]
+                active_group_frac = float(np.mean([1.0 if p > 0 else 0.0 for p in p_hat_per_prompt]))
+                print(f"Reward mean: {reward_mean:.4f}, active groups: {active_group_frac:.3f}")
 
                 generation_table = self._build_generation_table(all_prompts, all_responses, all_rewards)
 
-                # 3) Convert sampled text/rewards into tokenized training arrays.
-                ### TOKENIZE BATCH ###
-                print(f"Tokenizing batch, Epoch {epoch}, Global Step {global_step}")
-
-                batch_to_tokenize = {
+                # 3) Tokenize.
+                tokenized_batch = self.tokenize_batch({
                     'prompt': all_prompts,
                     'response': all_responses,
                     'rewards': all_rewards,
                     'sample_log_probs': all_sample_log_probs,
-                }
+                })
 
-                tokenized_batch = self.tokenize_batch(batch_to_tokenize)
-
-                # 4) Spin up update worker with latest checkpoint state.
-                ### LOAD MODEL FOR TRAINING ###
-                print(f"Loading model for Training, Epoch {epoch}, Global Step {global_step}")
-                model_path = self.model_name if last_checkpoint_dir is None else os.path.join(last_checkpoint_dir, "model")
-                optimizer_path = None if last_checkpoint_dir is None else os.path.join(last_checkpoint_dir, "optimizer.pt")
-                scheduler_path = None if last_checkpoint_dir is None else os.path.join(last_checkpoint_dir, "scheduler.pt")
-                
+                # 4) Update worker with latest checkpoint state.
+                optimizer_path = (
+                    None if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "optimizer.pt")
+                )
+                scheduler_path = (
+                    None if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "scheduler.pt")
+                )
                 self._create_update_worker(model_path, optimizer_path, scheduler_path)
 
-                # 5) Apply policy update(s). Off-policy extension: reuse the
-                # sampled rollouts for `ppo_epochs` mini-epochs of gradient
-                # updates with importance-weight correction.
-                ### UPDATE ###
-                print(f"Updating model, Epoch {epoch}, Global Step {global_step}, ppo_epochs={self.ppo_epochs}")
+                # 5) MaxRL update(s).
                 all_metrics = None
                 for inner_epoch in range(self.ppo_epochs):
                     inner_metrics = ray.get(self.update_worker.update_gradient_accumulation.remote(
@@ -324,21 +323,28 @@ class RLOOTrainer:
                         sample_log_probs=tokenized_batch["sample_log_probs"],
                     ))
                     inner_metrics['inner_epoch'] = inner_epoch
-                    all_metrics = inner_metrics  # keep last for compatibility
+                    all_metrics = inner_metrics
                     if self.ppo_epochs > 1:
-                        wandb.log({f'inner/{k}': v for k, v in inner_metrics.items() if isinstance(v, (int, float, np.floating, np.integer))}, step=global_step)
+                        wandb.log(
+                            {f'inner/{k}': v for k, v in inner_metrics.items()
+                             if isinstance(v, (int, float, np.floating, np.integer))},
+                            step=global_step,
+                        )
 
-                print(f"Saving checkpoint, Epoch {epoch}, Global Step {global_step}")
+                # Save checkpoint (persistent or scratch).
                 if self.save_every_n_steps > 0 and global_step % self.save_every_n_steps == 0:
-                    # save checkpoint to save_dir to load for evaluation + sampling
-                    save_dir = os.path.join(self.save_dir, self.wandb_project, self.wandb_name, f"epoch_{epoch}_step_{global_step}")
+                    save_dir = os.path.join(
+                        self.save_dir, self.wandb_project, self.wandb_name,
+                        f"epoch_{epoch}_step_{global_step}",
+                    )
                 else:
-                    # save checkpoint to tmp_dir to load for sampling
-                    save_dir = os.path.join(self.save_dir, self.wandb_project, self.wandb_name, f"latest_checkpoint")
+                    save_dir = os.path.join(
+                        self.save_dir, self.wandb_project, self.wandb_name, "latest_checkpoint",
+                    )
                 if os.path.exists(save_dir):
                     shutil.rmtree(save_dir)
                 os.makedirs(save_dir, exist_ok=True)
-                    
+
                 save_model_path = os.path.join(save_dir, "model")
                 save_optimizer_path = os.path.join(save_dir, "optimizer.pt")
                 save_scheduler_path = os.path.join(save_dir, "scheduler.pt")
@@ -346,42 +352,32 @@ class RLOOTrainer:
                     model_path=save_model_path,
                     optimizer_path=save_optimizer_path,
                     scheduler_path=save_scheduler_path,
-                    load_checkpoint=False
+                    load_checkpoint=False,
                 ))
                 ray.get(self.update_worker.save_checkpoint.remote())
                 last_checkpoint_dir = save_dir
 
-                print("-" * 100)
+                print("-" * 80)
                 print(f"Epoch {epoch}, Global Step {global_step}")
-                scientific_metric_names = {
-                    "lr",
-                    "kl_loss",
-                    "weight_mse",
-                    "weight_max_abs_diff",
-                    "weight_nonzero_diff_ratio",
-                    "weight_changed_tensor_ratio",
-                }
-                for metric_name, metric_value in all_metrics.items():
-                    if isinstance(metric_value, (float, np.floating)):
-                        metric_value_float = float(metric_value)
-                        if (
-                            metric_name in scientific_metric_names
-                            or (0 < abs(metric_value_float) < 1e-4)
-                        ):
-                            print(f"{metric_name}: {metric_value_float:.6e}")
+                scientific_metric_names = {"lr", "kl_loss"}
+                for k, v in all_metrics.items():
+                    if isinstance(v, (float, np.floating)):
+                        v = float(v)
+                        if k in scientific_metric_names or (0 < abs(v) < 1e-4):
+                            print(f"{k}: {v:.6e}")
                         else:
-                            print(f"{metric_name}: {metric_value_float:.4f}")
+                            print(f"{k}: {v:.4f}")
                     else:
-                        print(f"{metric_name}: {metric_value}")
-                print("-" * 100)
+                        print(f"{k}: {v}")
+                print("-" * 80)
 
-                metrics_logged = {'train/'+ k: v for k, v in all_metrics.items()}
-
+                metrics_logged = {'train/' + k: v for k, v in all_metrics.items()}
                 log_dict = {
                     "train/epoch": epoch,
                     "train/train_iter": train_iter,
                     "train/global_step": global_step,
                     "sampling/reward_mean": reward_mean,
+                    "sampling/active_group_frac": active_group_frac,
                     **metrics_logged,
                 }
                 if generation_table is not None:
@@ -389,16 +385,17 @@ class RLOOTrainer:
 
                 self.wandb.log(log_dict, step=global_step)
                 global_step += 1
-        
+
         if self.sampling_worker is not None:
             ray.kill(self.sampling_worker)
             self.sampling_worker = None
         if self.update_worker is not None:
             ray.kill(self.update_worker)
             self.update_worker = None
-        
+
         ray.shutdown()
         self.wandb.finish()
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -406,14 +403,14 @@ if __name__ == "__main__":
     parser.add_argument('--ref_model_name', type=str, default=None)
     parser.add_argument('--tokenizer_name', type=str, default=None)
     parser.add_argument('--dataset_name', type=str, default='asingh15/countdown_tasks_3to4')
-    parser.add_argument('--wandb_project', type=str, default='rloo_default_project')
+    parser.add_argument('--wandb_project', type=str, default='maxrl_default_project')
     parser.add_argument('--wandb_name', type=str, default='test')
     parser.add_argument('--lr_schedule', type=str, default='constant')
     parser.add_argument('--learning_rate', type=float, default=1e-5)
-    parser.add_argument('--warmup_ratio', type=float, default=0.05)
+    parser.add_argument('--warmup_ratio', type=float, default=0.0)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--group_size', type=int, default=2)
+    parser.add_argument('--group_size', type=int, default=8)
     parser.add_argument('--entropy_coefficient', type=float, default=0.01)
     parser.add_argument('--kl_divergence_coefficient', type=float, default=0.0)
     parser.add_argument('--num_training_steps', type=int, default=250)
@@ -431,10 +428,14 @@ if __name__ == "__main__":
     parser.add_argument('--disable_chunked_prefill', action='store_true')
     parser.add_argument('--max_num_seqs', type=int, default=64)
     parser.add_argument('--max_table_rows', type=int, default=20)
-    parser.add_argument('--save_every_n_steps', type=int, default=-1) # -1 means don't save every n steps
-    parser.add_argument('--save_dir', type=str, default='checkpoints/rloo_checkpoints')
-    parser.add_argument('--ppo_epochs', type=int, default=1, help='K: number of inner update epochs per sampled batch (off-policy extension)')
-    parser.add_argument('--importance_weight_clip', type=float, default=5.0, help='Per-sequence importance weight clip (0 disables)')
+    parser.add_argument('--save_every_n_steps', type=int, default=-1)
+    parser.add_argument('--save_dir', type=str, default='checkpoints/maxrl_checkpoints')
+    parser.add_argument('--ppo_epochs', type=int, default=1,
+                        help='K: number of inner update epochs per sampled batch (off-policy reuse)')
+    parser.add_argument('--importance_weight_clip', type=float, default=5.0,
+                        help='Per-sequence importance weight clip (0 disables)')
+    parser.add_argument('--success_threshold', type=float, default=0.5,
+                        help='Reward threshold above which a rollout counts as a success for the MaxRL weighting.')
     args = parser.parse_args()
     if args.enable_chunked_prefill and args.disable_chunked_prefill:
         raise ValueError("Cannot set both --enable_chunked_prefill and --disable_chunked_prefill.")
@@ -447,8 +448,6 @@ if __name__ == "__main__":
     del args.disable_chunked_prefill
 
     ray.init()
-    
-    trainer = RLOOTrainer(
-        **vars(args)
-    )
+
+    trainer = MaxRLTrainer(**vars(args))
     trainer.train()

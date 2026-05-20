@@ -77,6 +77,11 @@ student_code/
 │   ├── rloo_dataset.py         # RLOO dataset loader
 │   ├── train_rloo.sh           # Example RLOO launcher
 │   └── train_rloo_modal.sh     # Modal RLOO launcher
+├── maxrl_trainer/              # Novel extension: MaxRL (log p_theta) objective
+│   ├── maxrl.py                # MaxRL orchestration loop (reuses RLOO sampler)
+│   ├── maxrl_update_worker.py  # Successful-conditional policy-gradient worker
+│   ├── train_maxrl.sh          # Local MaxRL launcher
+│   └── train_maxrl_modal.sh    # Modal MaxRL launcher
 └── evaluation/
     ├── countdown.py            # Answer extraction + validation + reward
     ├── countdown_eval.py       # Batch evaluation with vLLM
@@ -303,6 +308,42 @@ What you need to implement:
 
 Important config detail:
 - `lr_schedule='constant'` currently requires `warmup_ratio=0.0` in update worker.
+
+### 8.4 MaxRL Stage (Novel Extension)
+
+MaxRL (Tajwar et al., 2026) optimizes the maximum-likelihood objective
+$J_{ML}(x) = \log p_\theta(\text{success} \mid x)$ rather than the standard RL
+objective $\mathbb{E}[p_\theta(\text{success} \mid x)]$. With $G$ rollouts per
+prompt and $S$ of them labeled successful, the gradient estimator reduces to
+the per-prompt average of $\nabla \log \pi(y_i\mid x)$ over the successful
+rollouts only (zero contribution from prompts with $S=0$).
+
+Entry files:
+- `maxrl_trainer/maxrl.py`
+- `maxrl_trainer/maxrl_update_worker.py`
+- `maxrl_trainer/train_maxrl.sh`
+- `maxrl_trainer/train_maxrl_modal.sh`
+
+Typical local command:
+
+```bash
+export MODEL_NAME=path-or-hf-repo-of-initial-policy
+export DATASET_NAME=your-rloo-dataset
+bash maxrl_trainer/train_maxrl.sh
+```
+
+Typical Modal command:
+
+```bash
+export MODEL_NAME=path-or-hf-repo-of-initial-policy
+export DATASET_NAME=your-rloo-dataset
+bash maxrl_trainer/train_maxrl_modal.sh
+```
+
+Implementation notes:
+- Reuses `rloo_trainer/sampling_worker.py` and `rloo_trainer/rloo_dataset.py` so only the update worker is novel.
+- `--success_threshold` controls which rewards count as successes (default 0.5; Countdown rewards live in {0.0, 0.1, 1.0}).
+- Logs `success_rate`, `p_hat_mean/min/max`, and `active_group_frac` to W&B for noise-mitigation experiments downstream.
 
 ## 9. Evaluation Workflow
 

@@ -70,6 +70,87 @@ def save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir):
     }, os.path.join(output_dir, 'train_states.pth'))
     print(f"Model saved to {output_dir}")
 
+def _sequence_logprobs(model, input_ids, attention_mask, is_response_token,
+                       average_logps=False, no_grad=False):
+    """Compute summed (or averaged) log-prob of response tokens for each example.
+
+    Returns a tensor of shape [B] (per-sequence log-prob).
+    """
+    ctx = torch.no_grad() if no_grad else torch.enable_grad()
+    with ctx:
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        # Predict token t+1 from position t.
+        shift_logits = logits[..., :-1, :].float()
+        shift_labels = input_ids[..., 1:]
+        shift_mask = is_response_token[..., 1:].to(shift_logits.dtype)
+
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_logp = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        token_logp = token_logp * shift_mask  # zero out non-response positions
+
+        seq_logp_sum = token_logp.sum(dim=-1)
+        if average_logps:
+            counts = shift_mask.sum(dim=-1).clamp(min=1.0)
+            return seq_logp_sum / counts
+        return seq_logp_sum
+
+
+@torch.no_grad()
+def evaluate_ipo(model, reference_model, dataloader, device, beta,
+                 average_logps, loss_type, max_batches=None):
+    """Evaluate IPO/DPO loss + reward margin on a held-out split."""
+    model.eval()
+    total_loss = 0.0
+    total_margin = 0.0
+    total_chosen_rw = 0.0
+    total_rejected_rw = 0.0
+    total_acc = 0.0
+    n = 0
+    for i, batch in enumerate(dataloader):
+        if max_batches is not None and i >= max_batches:
+            break
+        ids_w = batch['input_ids_w'].to(device)
+        am_w = batch['attention_mask_w'].to(device)
+        rt_w = batch['is_response_token_w'].to(device)
+        ids_l = batch['input_ids_l'].to(device)
+        am_l = batch['attention_mask_l'].to(device)
+        rt_l = batch['is_response_token_l'].to(device)
+
+        pol_w = _sequence_logprobs(model, ids_w, am_w, rt_w, average_logps, no_grad=True)
+        pol_l = _sequence_logprobs(model, ids_l, am_l, rt_l, average_logps, no_grad=True)
+        ref_w = _sequence_logprobs(reference_model, ids_w, am_w, rt_w, average_logps, no_grad=True)
+        ref_l = _sequence_logprobs(reference_model, ids_l, am_l, rt_l, average_logps, no_grad=True)
+
+        h = (pol_w - ref_w) - (pol_l - ref_l)
+        chosen_rw = beta * (pol_w - ref_w)
+        rejected_rw = beta * (pol_l - ref_l)
+        margin = chosen_rw - rejected_rw
+        if loss_type == 'ipo':
+            loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+        else:  # dpo
+            loss = -F.logsigmoid(beta * h).mean()
+        acc = (margin > 0).float().mean()
+
+        bs = ids_w.size(0)
+        total_loss += loss.item() * bs
+        total_margin += margin.mean().item() * bs
+        total_chosen_rw += chosen_rw.mean().item() * bs
+        total_rejected_rw += rejected_rw.mean().item() * bs
+        total_acc += acc.item() * bs
+        n += bs
+    model.train()
+    if n == 0:
+        return {}
+    return {
+        'loss': total_loss / n,
+        'reward_margin': total_margin / n,
+        'chosen_reward': total_chosen_rw / n,
+        'rejected_reward': total_rejected_rw / n,
+        'pref_acc': total_acc / n,
+    }
+
+
 def train(
     model, 
     tokenizer, 
@@ -87,14 +168,87 @@ def train(
     beta=0.1,
     average_logps=False,
     loss_type='ipo',
+    eval_every=50,
 ):
-    # TODO(student): implement IPO/DPO-style pairwise optimization.
-    # Expected high-level flow:
-    # 1) Compute policy log-probs for chosen/rejected responses.
-    # 2) Compute frozen-reference log-probs for chosen/rejected responses.
-    # 3) Build the pairwise objective (IPO or related variant).
-    # 4) Apply gradient accumulation, clipping, logging, and checkpointing.
-    raise NotImplementedError("This function is not implemented")
+    """Pairwise preference optimization loop (DPO or IPO)."""
+    model.train()
+    reference_model.eval()
+    global_step = 0
+    micro_step = 0
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(num_epochs):
+        pbar = tqdm.tqdm(train_dataloader, desc=f"epoch {epoch}")
+        for batch in pbar:
+            ids_w = batch['input_ids_w'].to(device)
+            am_w = batch['attention_mask_w'].to(device)
+            rt_w = batch['is_response_token_w'].to(device)
+            ids_l = batch['input_ids_l'].to(device)
+            am_l = batch['attention_mask_l'].to(device)
+            rt_l = batch['is_response_token_l'].to(device)
+
+            # Policy log-probs (gradient).
+            pol_w = _sequence_logprobs(model, ids_w, am_w, rt_w, average_logps)
+            pol_l = _sequence_logprobs(model, ids_l, am_l, rt_l, average_logps)
+            # Reference log-probs (no gradient, frozen reference).
+            with torch.no_grad():
+                ref_w = _sequence_logprobs(reference_model, ids_w, am_w, rt_w, average_logps, no_grad=True)
+                ref_l = _sequence_logprobs(reference_model, ids_l, am_l, rt_l, average_logps, no_grad=True)
+
+            # h = log pi/ref(y_w|x) - log pi/ref(y_l|x)
+            h = (pol_w - ref_w) - (pol_l - ref_l)
+            chosen_rw = beta * (pol_w - ref_w)
+            rejected_rw = beta * (pol_l - ref_l)
+            margin = (chosen_rw - rejected_rw).detach()
+
+            if loss_type == 'ipo':
+                # IPO: squared deviation from 1/(2 beta).
+                loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+            elif loss_type == 'dpo':
+                loss = -F.logsigmoid(beta * h).mean()
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
+
+            (loss / gradient_accumulation_steps).backward()
+            micro_step += 1
+
+            if micro_step % gradient_accumulation_steps == 0:
+                if gradient_clipping is not None and gradient_clipping > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                wandb.log({
+                    'train/loss': loss.detach().float().item(),
+                    'train/reward_margin': margin.mean().item(),
+                    'train/chosen_reward': chosen_rw.detach().mean().float().item(),
+                    'train/rejected_reward': rejected_rw.detach().mean().float().item(),
+                    'train/pref_acc': (margin > 0).float().mean().item(),
+                    'train/lr': scheduler.get_last_lr()[0],
+                    'train/epoch': epoch,
+                    'train/global_step': global_step,
+                }, step=global_step)
+
+                if eval_every > 0 and global_step % eval_every == 0:
+                    eval_metrics = evaluate_ipo(
+                        model, reference_model, test_dataloader, device,
+                        beta, average_logps, loss_type, max_batches=10,
+                    )
+                    wandb.log({f'test/{k}': v for k, v in eval_metrics.items()}, step=global_step)
+                    pbar.set_postfix(loss=loss.item(), margin=margin.mean().item())
+
+        full_metrics = evaluate_ipo(
+            model, reference_model, test_dataloader, device,
+            beta, average_logps, loss_type,
+        )
+        wandb.log({f'test/epoch_{k}': v for k, v in full_metrics.items()}, step=global_step)
+        print(f"[epoch {epoch}] full test {full_metrics}")
+
+    if save_model:
+        save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
+    clear_cache(model)
 
 def main():
     parser = argparse.ArgumentParser()
