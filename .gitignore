@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training artifacts
+checkpoints/
+*.pt
+wandb/
+.modal/
+
+# Local env
+.venv/
+.env

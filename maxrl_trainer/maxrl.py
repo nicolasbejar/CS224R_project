@@ -34,6 +34,16 @@ from evaluation.countdown import compute_score
 from rloo_trainer.sampling_worker import SamplingWorker
 from rloo_trainer.rloo_dataset import get_dataloaders
 from maxrl_trainer.maxrl_update_worker import MaxRLUpdateWorker
+# Extension: imperfect-reward modelling, RLAIF de-noising, and a noise-aware
+# curriculum. All default OFF so standard MaxRL behaviour is unchanged.
+from maxrl_trainer.extension.reward_noise import SymmetricRewardFlipNoise
+from maxrl_trainer.extension.rlaif import (
+    RLAIFConfig,
+    SimulatedJudge,
+    VLLMJudge,
+    combine_rewards,
+)
+from maxrl_trainer.extension.curriculum import PromptReweightingCurriculum
 
 
 class MaxRLTrainer:
@@ -75,6 +85,20 @@ class MaxRLTrainer:
         ppo_epochs=1,
         importance_weight_clip=5.0,
         success_threshold=0.5,
+        # ---- Extension flags (all default OFF -> standard MaxRL) ----
+        reward_noise_p=0.0,
+        reward_noise_seed=0,
+        use_rlaif=False,
+        judge_backend='simulated',
+        rlaif_combine='agree_gate',
+        judge_error_rate=0.05,
+        judge_correlation=0.0,
+        judge_seed=0,
+        judge_model='Qwen/Qwen2.5-7B-Instruct',
+        use_curriculum=False,
+        curriculum_kappa=1.0,
+        curriculum_w_min=0.1,
+        curriculum_ema_decay=0.9,
     ):
         self.model_name = model_name
         self.ref_model_name = self.model_name if ref_model_name is None else ref_model_name
@@ -112,6 +136,70 @@ class MaxRLTrainer:
         self.ppo_epochs = max(1, int(ppo_epochs))
         self.importance_weight_clip = float(importance_weight_clip)
         self.success_threshold = float(success_threshold)
+
+        # ---- Extension: imperfect-reward pipeline ----
+        # 1) Symmetric reward-flip noise (verifier as a binary symmetric channel).
+        self.reward_noise_p = float(reward_noise_p)
+        self.reward_noise_seed = int(reward_noise_seed)
+        self.reward_noise = (
+            SymmetricRewardFlipNoise(
+                flip_prob=self.reward_noise_p,
+                success_threshold=self.success_threshold,
+                seed=self.reward_noise_seed,
+            )
+            if self.reward_noise_p > 0.0
+            else None
+        )
+        # 2) RLAIF judge channel (agreement gate de-noises the verifier).
+        self.use_rlaif = bool(use_rlaif)
+        self.judge_backend = str(judge_backend)
+        self.rlaif_combine = str(rlaif_combine)
+        self.judge_error_rate = float(judge_error_rate)
+        self.judge_correlation = float(judge_correlation)
+        self.judge = None
+        if self.use_rlaif:
+            if self.judge_backend == 'simulated':
+                self.judge = SimulatedJudge(
+                    error_rate=self.judge_error_rate,
+                    seed=int(judge_seed),
+                    success_threshold=self.success_threshold,
+                )
+            elif self.judge_backend == 'vllm':
+                self.judge = VLLMJudge(RLAIFConfig(
+                    enabled=True,
+                    backend='vllm',
+                    combine=self.rlaif_combine,
+                    success_threshold=self.success_threshold,
+                    judge_model=str(judge_model),
+                ))
+            else:
+                raise ValueError(f"unknown judge_backend: {self.judge_backend!r}")
+        # 3) Noise-aware prompt-reweighting curriculum.
+        self.use_curriculum = bool(use_curriculum)
+        self.curriculum = None
+        if self.use_curriculum:
+            # The effective post-gate noise floor is p when RLAIF is off, and the
+            # agreement-gate floor p * q when RLAIF is on (so the curriculum does
+            # not fight the judge). n_eff reflects the EMA window ~ G / (1 - decay).
+            effective_floor = (
+                self.reward_noise_p * self.judge_error_rate
+                if self.use_rlaif
+                else self.reward_noise_p
+            )
+            n_eff = float(self.group_size) / max(1.0 - float(curriculum_ema_decay), 1e-6)
+            self.curriculum = PromptReweightingCurriculum.from_noise(
+                flip_prob=effective_floor,
+                n_eff=n_eff,
+                kappa=float(curriculum_kappa),
+                w_min=float(curriculum_w_min),
+                ema_decay=float(curriculum_ema_decay),
+            )
+        # Master switch: when no extension feature is on, the reward pipeline is
+        # skipped entirely so the rewards passed downstream are byte-identical to
+        # vanilla MaxRL.
+        self._extension_active = bool(
+            self.reward_noise is not None or self.use_rlaif or self.use_curriculum
+        )
 
         dataloaders = get_dataloaders(
             self.dataset_name,
@@ -252,6 +340,81 @@ class MaxRLTrainer:
             "sample_log_probs": np.array(all_sample_log_probs_flattened, dtype=np.float32),
         }
 
+    def _apply_reward_pipeline(
+        self,
+        all_rewards,
+        all_prompts,
+        all_responses,
+        all_ground_truth,
+        step,
+    ):
+        """Extension: corrupt -> de-noise -> curriculum-reweight the rewards.
+
+        Operates on prompt-major nested reward lists ``all_rewards[B][G]``.
+        Returns ``(processed_rewards, prompt_weights, ext_metrics)`` where
+        ``prompt_weights`` is a ``[B]`` array (or ``None`` if no curriculum) and
+        ``ext_metrics`` is a dict of diagnostics for logging.
+
+        When no extension feature is enabled this method is never called, so
+        vanilla MaxRL rewards are left untouched.
+        """
+        lengths = [len(g) for g in all_rewards]
+        clean_flat = np.asarray([r for g in all_rewards for r in g], dtype=np.float64)
+        ext_metrics = {}
+
+        # 1) Symmetric reward-flip noise on the verifier success bit.
+        if self.reward_noise is not None:
+            noisy_flat, flip_mask = self.reward_noise.corrupt(clean_flat, step=step)
+            ext_metrics['ext/flip_frac'] = float(np.mean(flip_mask))
+        else:
+            noisy_flat = clean_flat.copy()
+            flip_mask = np.zeros_like(clean_flat, dtype=bool)
+
+        # 2) RLAIF judge channel + combination rule.
+        final_flat = noisy_flat
+        if self.use_rlaif and self.judge is not None:
+            if self.judge_backend == 'simulated':
+                judge_flat, judge_err = self.judge.judge(
+                    clean_flat,
+                    verifier_flip_mask=flip_mask,
+                    correlation=self.judge_correlation,
+                    step=step,
+                )
+                ext_metrics['ext/judge_err_frac'] = float(np.mean(judge_err))
+            else:  # vllm
+                prompts_repeated = [p for p, g in zip(all_prompts, all_rewards) for _ in g]
+                responses_flat = [r for sub in all_responses for r in sub]
+                gt_repeated = [gt for gt, g in zip(all_ground_truth, all_rewards) for _ in g]
+                judge_flat = self.judge.judge(prompts_repeated, responses_flat, gt_repeated)
+            final_flat = combine_rewards(
+                noisy_flat,
+                judge_flat,
+                mode=self.rlaif_combine,
+                success_threshold=self.success_threshold,
+            )
+
+        # Reshape back to prompt-major groups.
+        processed = []
+        idx = 0
+        for n in lengths:
+            processed.append([float(v) for v in final_flat[idx:idx + n]])
+            idx += n
+
+        # 3) Noise-aware curriculum: observe this step's (post-pipeline) success
+        # rates and emit a per-prompt weight in [w_min, 1].
+        prompt_weights = None
+        if self.curriculum is not None:
+            success_rates = [
+                float(np.mean([1.0 if r > self.success_threshold else 0.0 for r in rs]))
+                for rs in processed
+            ]
+            prompt_weights = self.curriculum.step(all_prompts, success_rates)
+            ext_metrics['ext/curriculum_weight_mean'] = float(np.mean(prompt_weights))
+            ext_metrics['ext/curriculum_weight_min'] = float(np.min(prompt_weights))
+            prompt_weights = np.asarray(prompt_weights, dtype=np.float32)
+
+        return processed, prompt_weights, ext_metrics
+
     def train(self):
         last_checkpoint_dir = None
         global_step = 0
@@ -282,6 +445,21 @@ class MaxRLTrainer:
                 all_rewards = []
                 for curr_responses, curr_ground_truth in zip(all_responses, all_ground_truth):
                     all_rewards.append([compute_score(x, curr_ground_truth) for x in curr_responses])
+
+                # 2b) Extension: corrupt -> RLAIF de-noise -> curriculum reweight.
+                # Skipped entirely (no-op) when no extension feature is enabled.
+                prompt_weights = None
+                ext_metrics = {}
+                clean_reward_mean = float(np.mean(all_rewards).item())
+                if self._extension_active:
+                    all_rewards, prompt_weights, ext_metrics = self._apply_reward_pipeline(
+                        all_rewards,
+                        all_prompts,
+                        all_responses,
+                        all_ground_truth,
+                        step=global_step,
+                    )
+
                 reward_mean = float(np.mean(all_rewards).item())
                 # Empirical per-prompt success rate p_hat = mean(1[r > thr]) over the group.
                 p_hat_per_prompt = [
@@ -321,6 +499,7 @@ class MaxRLTrainer:
                         is_response_token=tokenized_batch["is_response_token"],
                         rewards=tokenized_batch["rewards"],
                         sample_log_probs=tokenized_batch["sample_log_probs"],
+                        prompt_weights=prompt_weights,
                     ))
                     inner_metrics['inner_epoch'] = inner_epoch
                     all_metrics = inner_metrics
@@ -380,6 +559,9 @@ class MaxRLTrainer:
                     "sampling/active_group_frac": active_group_frac,
                     **metrics_logged,
                 }
+                if self._extension_active:
+                    log_dict["sampling/clean_reward_mean"] = clean_reward_mean
+                    log_dict.update(ext_metrics)
                 if generation_table is not None:
                     log_dict["samples/generations"] = generation_table
 
@@ -436,6 +618,35 @@ if __name__ == "__main__":
                         help='Per-sequence importance weight clip (0 disables)')
     parser.add_argument('--success_threshold', type=float, default=0.5,
                         help='Reward threshold above which a rollout counts as a success for the MaxRL weighting.')
+    # ---- Extension flags (all default OFF -> standard MaxRL) ----
+    parser.add_argument('--reward_noise_p', type=float, default=0.0,
+                        help='Symmetric reward-flip probability p on the verifier success bit (0 disables).')
+    parser.add_argument('--reward_noise_seed', type=int, default=0,
+                        help='Base seed for the reward-flip noise RNG.')
+    parser.add_argument('--use_rlaif', action='store_true',
+                        help='Enable the RLAIF judge channel to de-noise the verifier.')
+    parser.add_argument('--judge_backend', type=str, default='simulated',
+                        choices=['simulated', 'vllm'],
+                        help='RLAIF judge backend: a controllable simulated judge or a real vLLM LLM judge.')
+    parser.add_argument('--rlaif_combine', type=str, default='agree_gate',
+                        choices=['agree_gate', 'or', 'majority', 'soft_avg'],
+                        help='Rule for combining the verifier and judge channels.')
+    parser.add_argument('--judge_error_rate', type=float, default=0.05,
+                        help='Simulated-judge marginal error rate q.')
+    parser.add_argument('--judge_correlation', type=float, default=0.0,
+                        help='Fraction of judge errors coupled to verifier flips (erodes the RLAIF benefit).')
+    parser.add_argument('--judge_seed', type=int, default=0,
+                        help='Base seed for the simulated judge RNG.')
+    parser.add_argument('--judge_model', type=str, default='Qwen/Qwen2.5-7B-Instruct',
+                        help='Model name for the vLLM judge backend.')
+    parser.add_argument('--use_curriculum', action='store_true',
+                        help='Enable the noise-aware prompt-reweighting curriculum.')
+    parser.add_argument('--curriculum_kappa', type=float, default=1.0,
+                        help='Strictness of the curriculum gate in floor standard deviations.')
+    parser.add_argument('--curriculum_w_min', type=float, default=0.1,
+                        help='Minimum weight assigned to fully-suppressed prompts.')
+    parser.add_argument('--curriculum_ema_decay', type=float, default=0.9,
+                        help='EMA decay for the per-prompt success-rate estimate.')
     args = parser.parse_args()
     if args.enable_chunked_prefill and args.disable_chunked_prefill:
         raise ValueError("Cannot set both --enable_chunked_prefill and --disable_chunked_prefill.")

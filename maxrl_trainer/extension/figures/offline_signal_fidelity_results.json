@@ -1,0 +1,292 @@
+{
+  "judge_error": 0.1,
+  "n_seeds": 100,
+  "models": {
+    "IPO": {
+      "n_prompts": 50,
+      "mean_success": 0.3775,
+      "zero_success_prompt_fraction": 0.24,
+      "metrics": {
+        "flip_grid": [
+          0.0,
+          0.001,
+          0.005,
+          0.01,
+          0.02,
+          0.05,
+          0.1,
+          0.2
+        ],
+        "maxrl": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.020904658239460014,
+            "spurious_success_prompt_rate": 0.05,
+            "mean_weight_on_false_positives": 0.5041942259129761
+          },
+          {
+            "false_positive_weight_fraction": 0.04470235862802052,
+            "spurious_success_prompt_rate": 0.11,
+            "mean_weight_on_false_positives": 0.5060255466595521
+          },
+          {
+            "false_positive_weight_fraction": 0.0813658618677205,
+            "spurious_success_prompt_rate": 0.2,
+            "mean_weight_on_false_positives": 0.454095785112382
+          },
+          {
+            "false_positive_weight_fraction": 0.2056184934565603,
+            "spurious_success_prompt_rate": 0.54,
+            "mean_weight_on_false_positives": 0.4044012657210807
+          },
+          {
+            "false_positive_weight_fraction": 0.30764886341728376,
+            "spurious_success_prompt_rate": 0.8,
+            "mean_weight_on_false_positives": 0.3211013186622935
+          },
+          {
+            "false_positive_weight_fraction": 0.4206510129222324,
+            "spurious_success_prompt_rate": 0.99,
+            "mean_weight_on_false_positives": 0.22471097742190008
+          }
+        ],
+        "maxrl_rlaif": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.004316455247517053,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.5271645021645021
+          },
+          {
+            "false_positive_weight_fraction": 0.004319878288950453,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.5271645021645021
+          },
+          {
+            "false_positive_weight_fraction": 0.008600334252852048,
+            "spurious_success_prompt_rate": 0.02,
+            "mean_weight_on_false_positives": 0.5261462551785132
+          },
+          {
+            "false_positive_weight_fraction": 0.017672009487563884,
+            "spurious_success_prompt_rate": 0.04,
+            "mean_weight_on_false_positives": 0.5296036859028987
+          },
+          {
+            "false_positive_weight_fraction": 0.039675792475896164,
+            "spurious_success_prompt_rate": 0.09,
+            "mean_weight_on_false_positives": 0.5332039427858241
+          },
+          {
+            "false_positive_weight_fraction": 0.09666475383456508,
+            "spurious_success_prompt_rate": 0.22,
+            "mean_weight_on_false_positives": 0.5178468955423129
+          }
+        ],
+        "maxrl_rlaif_curriculum": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.003953881921712957,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.477585160658288
+          },
+          {
+            "false_positive_weight_fraction": 0.003925880479660499,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.4733996244640804
+          },
+          {
+            "false_positive_weight_fraction": 0.007715867408573633,
+            "spurious_success_prompt_rate": 0.02,
+            "mean_weight_on_false_positives": 0.46547327467687943
+          },
+          {
+            "false_positive_weight_fraction": 0.015302553259249188,
+            "spurious_success_prompt_rate": 0.04,
+            "mean_weight_on_false_positives": 0.4498015701419869
+          },
+          {
+            "false_positive_weight_fraction": 0.032431808997489424,
+            "spurious_success_prompt_rate": 0.09,
+            "mean_weight_on_false_positives": 0.42280375480187465
+          },
+          {
+            "false_positive_weight_fraction": 0.07199293519872974,
+            "spurious_success_prompt_rate": 0.22,
+            "mean_weight_on_false_positives": 0.3613732470620556
+          }
+        ]
+      }
+    },
+    "SFT": {
+      "n_prompts": 50,
+      "mean_success": 0.33625,
+      "zero_success_prompt_fraction": 0.2,
+      "metrics": {
+        "flip_grid": [
+          0.0,
+          0.001,
+          0.005,
+          0.01,
+          0.02,
+          0.05,
+          0.1,
+          0.2
+        ],
+        "maxrl": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.018709423810708396,
+            "spurious_success_prompt_rate": 0.05,
+            "mean_weight_on_false_positives": 0.4646364882561202
+          },
+          {
+            "false_positive_weight_fraction": 0.04080512458890835,
+            "spurious_success_prompt_rate": 0.11,
+            "mean_weight_on_false_positives": 0.46811912482303514
+          },
+          {
+            "false_positive_weight_fraction": 0.07476994922776613,
+            "spurious_success_prompt_rate": 0.2,
+            "mean_weight_on_false_positives": 0.427431480871535
+          },
+          {
+            "false_positive_weight_fraction": 0.19660927441342582,
+            "spurious_success_prompt_rate": 0.54,
+            "mean_weight_on_false_positives": 0.38183679409022536
+          },
+          {
+            "false_positive_weight_fraction": 0.3059331853007479,
+            "spurious_success_prompt_rate": 0.8,
+            "mean_weight_on_false_positives": 0.3080550421975375
+          },
+          {
+            "false_positive_weight_fraction": 0.4373768161967447,
+            "spurious_success_prompt_rate": 0.99,
+            "mean_weight_on_false_positives": 0.21981237351336952
+          }
+        ],
+        "maxrl_rlaif": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0038720627460844576,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.5112413512413512
+          },
+          {
+            "false_positive_weight_fraction": 0.003873040539707206,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.5112413512413512
+          },
+          {
+            "false_positive_weight_fraction": 0.008361612632209761,
+            "spurious_success_prompt_rate": 0.02,
+            "mean_weight_on_false_positives": 0.5440531235613203
+          },
+          {
+            "false_positive_weight_fraction": 0.016753737436241218,
+            "spurious_success_prompt_rate": 0.04,
+            "mean_weight_on_false_positives": 0.5462817009948161
+          },
+          {
+            "false_positive_weight_fraction": 0.0379883211927135,
+            "spurious_success_prompt_rate": 0.09,
+            "mean_weight_on_false_positives": 0.537877042470682
+          },
+          {
+            "false_positive_weight_fraction": 0.09545314508083053,
+            "spurious_success_prompt_rate": 0.22,
+            "mean_weight_on_false_positives": 0.492413201827559
+          }
+        ],
+        "maxrl_rlaif_curriculum": [
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0,
+            "spurious_success_prompt_rate": 0.0,
+            "mean_weight_on_false_positives": 0.0
+          },
+          {
+            "false_positive_weight_fraction": 0.0035755869250821285,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.46417822571700024
+          },
+          {
+            "false_positive_weight_fraction": 0.0035515485764621288,
+            "spurious_success_prompt_rate": 0.01,
+            "mean_weight_on_false_positives": 0.4602038717747673
+          },
+          {
+            "false_positive_weight_fraction": 0.007605222093247003,
+            "spurious_success_prompt_rate": 0.02,
+            "mean_weight_on_false_positives": 0.4843271838796589
+          },
+          {
+            "false_positive_weight_fraction": 0.014733940533551537,
+            "spurious_success_prompt_rate": 0.04,
+            "mean_weight_on_false_positives": 0.4663690284584222
+          },
+          {
+            "false_positive_weight_fraction": 0.03205013798339487,
+            "spurious_success_prompt_rate": 0.09,
+            "mean_weight_on_false_positives": 0.4341715137340392
+          },
+          {
+            "false_positive_weight_fraction": 0.07501318991873533,
+            "spurious_success_prompt_rate": 0.22,
+            "mean_weight_on_false_positives": 0.3547692482832517
+          }
+        ]
+      }
+    }
+  }
+}

@@ -170,9 +170,16 @@ class MaxRLUpdateWorker:
         is_response_token: np.ndarray,
         rewards: np.ndarray,
         sample_log_probs: Optional[np.ndarray] = None,
+        prompt_weights: Optional[np.ndarray] = None,
         device='cuda',
     ):
-        """Split incoming batch into microbatches and call `update(...)`."""
+        """Split incoming batch into microbatches and call `update(...)`.
+
+        ``prompt_weights`` (extension): an optional ``[B]`` array of per-prompt
+        curriculum weights in ``[0, 1]`` that scale each prompt's MaxRL gradient
+        contribution. ``None`` (default) leaves the standard MaxRL behaviour
+        unchanged.
+        """
         update_metrics = None
         if self.gradient_accumulation_steps > 1:
             curr_batch_size = input_ids.shape[0]
@@ -187,11 +194,18 @@ class MaxRLUpdateWorker:
                 f"Microbatch size {group_per_gradient_accumulation_step} must be divisible by group_size "
                 f"{self.group_size} when using gradient_accumulation_steps={self.gradient_accumulation_steps}."
             )
+            prompts_per_step = group_per_gradient_accumulation_step // self.group_size
             all_metrics = []
             for i in range(self.gradient_accumulation_steps):
                 lo = i * group_per_gradient_accumulation_step
                 hi = (i + 1) * group_per_gradient_accumulation_step
                 curr_sample_log_probs = sample_log_probs[lo:hi] if sample_log_probs is not None else None
+                if prompt_weights is not None:
+                    p_lo = i * prompts_per_step
+                    p_hi = (i + 1) * prompts_per_step
+                    curr_prompt_weights = prompt_weights[p_lo:p_hi]
+                else:
+                    curr_prompt_weights = None
                 is_update_step = (i == self.gradient_accumulation_steps - 1)
                 curr_update_metrics = self.update(
                     input_ids[lo:hi],
@@ -201,6 +215,7 @@ class MaxRLUpdateWorker:
                     curr_sample_log_probs,
                     is_update_step,
                     device,
+                    prompt_weights=curr_prompt_weights,
                 )
                 all_metrics.append(curr_update_metrics)
             update_metrics = {}
@@ -217,6 +232,7 @@ class MaxRLUpdateWorker:
                 sample_log_probs,
                 True,
                 device,
+                prompt_weights=prompt_weights,
             )
 
         return update_metrics
@@ -231,6 +247,7 @@ class MaxRLUpdateWorker:
         is_update_step: bool = True,
         device='cuda',
         importance_weight_clip: Optional[float] = None,
+        prompt_weights: Optional[np.ndarray] = None,
     ):
         """One MaxRL policy gradient update with successful-conditional weights.
 
@@ -293,6 +310,15 @@ class MaxRLUpdateWorker:
         # Zero out groups with no successes explicitly (keeps shape, kills signal).
         active = (S_grp > 0).float()  # [B, 1]
         weights_grp = weights_grp * active
+        # ---- Extension: curriculum per-prompt re-weighting ----
+        # Scale each prompt's MaxRL contribution by an optional curriculum weight
+        # in [0, 1]. Default (None) -> all-ones, leaving standard MaxRL unchanged.
+        if prompt_weights is not None:
+            pw = torch.as_tensor(prompt_weights, dtype=torch.float32, device=device).view(B, 1)
+            weights_grp = weights_grp * pw
+            curriculum_weight_mean = float(pw.mean().item())
+        else:
+            curriculum_weight_mean = 1.0
         weights = weights_grp.reshape(N).detach()  # [N]
 
         # ---- Importance weighting (per-sequence; for off-policy reuse) ----
@@ -367,6 +393,7 @@ class MaxRLUpdateWorker:
             'p_hat_min': float(p_hat.min().item()),
             'p_hat_max': float(p_hat.max().item()),
             'active_group_frac': float(active_group_frac),
+            'curriculum_weight_mean': float(curriculum_weight_mean),
             'weight_mean_active': float(
                 (weights.sum() / max(float(success.sum().item()), 1.0)).item()
             ),
