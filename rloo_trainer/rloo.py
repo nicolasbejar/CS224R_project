@@ -68,6 +68,8 @@ class RLOOTrainer:
         max_table_rows=20,
         save_every_n_steps=-1,
         save_dir='checkpoints/rloo_checkpoints',
+        ppo_epochs=1,
+        importance_weight_clip=5.0,
     ):
         self.model_name = model_name
         self.ref_model_name = self.model_name if ref_model_name is None else ref_model_name
@@ -102,6 +104,9 @@ class RLOOTrainer:
         self.max_table_rows = max_table_rows
         self.save_every_n_steps = save_every_n_steps
         self.save_dir = save_dir
+        # Off-policy extension: reuse each sampled rollout batch for K updates.
+        self.ppo_epochs = max(1, int(ppo_epochs))
+        self.importance_weight_clip = float(importance_weight_clip)
         
         # DataLoader yields prompts + ground-truth metadata only.
         dataloaders = get_dataloaders(
@@ -166,6 +171,7 @@ class RLOOTrainer:
             weight_decay=self.weight_decay,
             warmup_ratio=self.warmup_ratio,
             num_training_steps=self.num_training_steps,
+            importance_weight_clip=self.importance_weight_clip,
         )
         ray.get(self.update_worker.load_checkpoint.remote())
         return self.update_worker
@@ -303,16 +309,24 @@ class RLOOTrainer:
                 
                 self._create_update_worker(model_path, optimizer_path, scheduler_path)
 
-                # 5) Apply one policy update (with optional grad accumulation).
+                # 5) Apply policy update(s). Off-policy extension: reuse the
+                # sampled rollouts for `ppo_epochs` mini-epochs of gradient
+                # updates with importance-weight correction.
                 ### UPDATE ###
-                print(f"Updating model, Epoch {epoch}, Global Step {global_step}")
-                all_metrics = ray.get(self.update_worker.update_gradient_accumulation.remote(
-                    input_ids=tokenized_batch["input_ids"],
-                    attention_mask=tokenized_batch["attention_mask"],
-                    is_response_token=tokenized_batch["is_response_token"],
-                    rewards=tokenized_batch["rewards"],
-                    sample_log_probs=tokenized_batch["sample_log_probs"],
-                ))
+                print(f"Updating model, Epoch {epoch}, Global Step {global_step}, ppo_epochs={self.ppo_epochs}")
+                all_metrics = None
+                for inner_epoch in range(self.ppo_epochs):
+                    inner_metrics = ray.get(self.update_worker.update_gradient_accumulation.remote(
+                        input_ids=tokenized_batch["input_ids"],
+                        attention_mask=tokenized_batch["attention_mask"],
+                        is_response_token=tokenized_batch["is_response_token"],
+                        rewards=tokenized_batch["rewards"],
+                        sample_log_probs=tokenized_batch["sample_log_probs"],
+                    ))
+                    inner_metrics['inner_epoch'] = inner_epoch
+                    all_metrics = inner_metrics  # keep last for compatibility
+                    if self.ppo_epochs > 1:
+                        wandb.log({f'inner/{k}': v for k, v in inner_metrics.items() if isinstance(v, (int, float, np.floating, np.integer))}, step=global_step)
 
                 print(f"Saving checkpoint, Epoch {epoch}, Global Step {global_step}")
                 if self.save_every_n_steps > 0 and global_step % self.save_every_n_steps == 0:
@@ -419,6 +433,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_table_rows', type=int, default=20)
     parser.add_argument('--save_every_n_steps', type=int, default=-1) # -1 means don't save every n steps
     parser.add_argument('--save_dir', type=str, default='checkpoints/rloo_checkpoints')
+    parser.add_argument('--ppo_epochs', type=int, default=1, help='K: number of inner update epochs per sampled batch (off-policy extension)')
+    parser.add_argument('--importance_weight_clip', type=float, default=5.0, help='Per-sequence importance weight clip (0 disables)')
     args = parser.parse_args()
     if args.enable_chunked_prefill and args.disable_chunked_prefill:
         raise ValueError("Cannot set both --enable_chunked_prefill and --disable_chunked_prefill.")

@@ -1,10 +1,26 @@
-"""Ray actor that applies policy-gradient updates for RLOO.
+"""Ray actor that applies MaxRL policy-gradient updates.
 
-The orchestrator (`rloo.py`) samples responses and computes rewards, then
-calls this worker with tokenized sequences to perform gradient updates.
+MaxRL (Tajwar et al., 2026) optimizes the maximum-likelihood objective
+    J_ML(x) = log p_theta(success | x)
+instead of the standard RL objective J_RL(x) = p_theta(success | x).
 
-This file is intentionally incomplete. Students are expected to implement
-`update(...)` while reusing the data/model/sampling setup provided here.
+Concretely, the MaxRL gradient is an importance-weighted version of REINFORCE
+in which each rollout is reweighted by 1 / p_theta(success | x):
+
+    grad_theta log p   =   grad_theta E[r]   /   E[r]
+                       =   E[ r * grad_theta log pi(y|x) ]   /   E[r]
+                       ~   ( 1 / S ) * sum_{i : r_i = 1} grad_theta log pi(y_i | x)
+
+where S is the number of successful rollouts in the group of G samples for a
+given prompt. This is the "successful-conditional" estimator described in our
+proposal (see Section 3): per-prompt, gradients are averaged only over the
+rollouts whose binary success indicator is 1, and prompts with zero successes
+in the group contribute no signal (weight = 0).
+
+This file mirrors `rloo_trainer/rloo_update_worker.py` so the rest of the
+training pipeline (sampling worker, tokenizer, orchestrator, checkpointing) is
+shared. The only methodological change is in the per-sample advantage /
+weighting computation inside `update(...)`.
 """
 
 import os
@@ -18,28 +34,31 @@ from typing import Optional
 
 warnings.filterwarnings("ignore")
 
+
 @ray.remote(num_gpus=1)
-class RLOOUpdateWorker:
-    """Owns policy/ref models and optimizer state for RLOO updates."""
+class MaxRLUpdateWorker:
+    """Owns policy/ref models and optimizer state for MaxRL updates."""
+
     def __init__(
-        self, 
-        model_path, 
-        optimizer_path, 
+        self,
+        model_path,
+        optimizer_path,
         scheduler_path,
-        tokenizer_path=None, 
+        tokenizer_path=None,
         ref_model_path=None,
         batch_size=64,
         gradient_accumulation_steps=1,
         gradient_clipping=1.0,
-        group_size=16, 
-        entropy_coefficient=0.01, 
-        kl_divergence_coefficient=0.0, 
+        group_size=16,
+        entropy_coefficient=0.01,
+        kl_divergence_coefficient=0.0,
         lr_schedule='constant',
-        learning_rate=1e-5, 
-        weight_decay=0.01, 
+        learning_rate=1e-5,
+        weight_decay=0.01,
         warmup_ratio=0.0,
         num_training_steps=250,
         importance_weight_clip=5.0,
+        success_threshold=0.5,
     ):
         self.model_path = model_path
         self.ref_model_path = ref_model_path if ref_model_path is not None else model_path
@@ -51,7 +70,7 @@ class RLOOUpdateWorker:
         self.gradient_clipping = gradient_clipping
         self.group_size = group_size
         if self.group_size < 2:
-            raise ValueError(f"group_size must be >= 2 for RLOO, got {self.group_size}")
+            raise ValueError(f"group_size must be >= 2 for MaxRL, got {self.group_size}")
         self.entropy_coefficient = entropy_coefficient
         self.kl_divergence_coefficient = kl_divergence_coefficient
         self.lr_schedule = lr_schedule
@@ -62,6 +81,9 @@ class RLOOUpdateWorker:
             raise NotImplementedError("Warmup ratio > 0 is not supported for constant learning rate schedule")
         self.num_training_steps = num_training_steps
         self.importance_weight_clip = float(importance_weight_clip)
+        # Threshold above which a (possibly soft) reward is treated as a success.
+        # Countdown rewards are in {0.0, 0.1, 1.0}; 0.5 selects fully-correct only.
+        self.success_threshold = float(success_threshold)
 
     def tear_down(self):
         """Release model/optimizer objects and clear GPU memory."""
@@ -91,7 +113,7 @@ class RLOOUpdateWorker:
     def load_checkpoint(self):
         """Load policy model, optional reference model, and optimizer/scheduler."""
         self.tear_down()
-        
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
@@ -108,18 +130,25 @@ class RLOOUpdateWorker:
             for param in self.ref_model.parameters():
                 param.requires_grad = False
 
-        if self.optimizer_path and self.scheduler_path and os.path.exists(self.optimizer_path) and os.path.exists(self.scheduler_path):
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        if (
+            self.optimizer_path
+            and self.scheduler_path
+            and os.path.exists(self.optimizer_path)
+            and os.path.exists(self.scheduler_path)
+        ):
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            )
             self.optimizer.load_state_dict(torch.load(self.optimizer_path))
             if self.lr_schedule == 'constant':
                 self.scheduler = torch.optim.lr_scheduler.ConstantLR(self.optimizer, factor=1.0)
             else:
                 raise ValueError(f"Invalid learning rate schedule: {self.lr_schedule}")
-            
             self.scheduler.load_state_dict(torch.load(self.scheduler_path))
         else:
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-            
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            )
             if self.lr_schedule == 'constant':
                 self.scheduler = torch.optim.lr_scheduler.ConstantLR(self.optimizer, factor=1.0)
             else:
@@ -131,10 +160,8 @@ class RLOOUpdateWorker:
         """Persist optimizer/scheduler state plus model+tokenizer weights."""
         torch.save(self.optimizer.state_dict(), self.optimizer_path)
         torch.save(self.scheduler.state_dict(), self.scheduler_path)
-
         self.model.save_pretrained(self.model_path)
         self.tokenizer.save_pretrained(self.model_path)
-
 
     def update_gradient_accumulation(
         self,
@@ -143,9 +170,16 @@ class RLOOUpdateWorker:
         is_response_token: np.ndarray,
         rewards: np.ndarray,
         sample_log_probs: Optional[np.ndarray] = None,
+        prompt_weights: Optional[np.ndarray] = None,
         device='cuda',
     ):
-        """Split incoming batch into microbatches and call `update(...)`."""
+        """Split incoming batch into microbatches and call `update(...)`.
+
+        ``prompt_weights`` (extension): an optional ``[B]`` array of per-prompt
+        curriculum weights in ``[0, 1]`` that scale each prompt's MaxRL gradient
+        contribution. ``None`` (default) leaves the standard MaxRL behaviour
+        unchanged.
+        """
         update_metrics = None
         if self.gradient_accumulation_steps > 1:
             curr_batch_size = input_ids.shape[0]
@@ -154,35 +188,41 @@ class RLOOUpdateWorker:
                 f"{self.gradient_accumulation_steps}."
             )
             group_per_gradient_accumulation_step = curr_batch_size // self.gradient_accumulation_steps
-            # Ensure each microbatch still contains full RLOO groups so the baseline is meaningful
+            # Ensure each microbatch still contains full groups so the per-prompt
+            # success counts (which set the MaxRL weights) are well defined.
             assert group_per_gradient_accumulation_step % self.group_size == 0, (
-                f"Microbatch size {group_per_gradient_accumulation_step} must be divisible by group_size {self.group_size} "
-                f"when using gradient_accumulation_steps={self.gradient_accumulation_steps}."
+                f"Microbatch size {group_per_gradient_accumulation_step} must be divisible by group_size "
+                f"{self.group_size} when using gradient_accumulation_steps={self.gradient_accumulation_steps}."
             )
+            prompts_per_step = group_per_gradient_accumulation_step // self.group_size
             all_metrics = []
             for i in range(self.gradient_accumulation_steps):
-                curr_input_ids = input_ids[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                curr_attention_mask = attention_mask[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                curr_is_response_token = is_response_token[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                curr_rewards = rewards[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                curr_sample_log_probs = None
-                if sample_log_probs is not None:
-                    curr_sample_log_probs = sample_log_probs[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                
+                lo = i * group_per_gradient_accumulation_step
+                hi = (i + 1) * group_per_gradient_accumulation_step
+                curr_sample_log_probs = sample_log_probs[lo:hi] if sample_log_probs is not None else None
+                if prompt_weights is not None:
+                    p_lo = i * prompts_per_step
+                    p_hi = (i + 1) * prompts_per_step
+                    curr_prompt_weights = prompt_weights[p_lo:p_hi]
+                else:
+                    curr_prompt_weights = None
                 is_update_step = (i == self.gradient_accumulation_steps - 1)
                 curr_update_metrics = self.update(
-                    curr_input_ids,
-                    curr_attention_mask,
-                    curr_is_response_token,
-                    curr_rewards,
+                    input_ids[lo:hi],
+                    attention_mask[lo:hi],
+                    is_response_token[lo:hi],
+                    rewards[lo:hi],
                     curr_sample_log_probs,
                     is_update_step,
                     device,
+                    prompt_weights=curr_prompt_weights,
                 )
                 all_metrics.append(curr_update_metrics)
             update_metrics = {}
             for metric_name in all_metrics[0].keys():
-                update_metrics[metric_name] = np.mean([metric[metric_name] for metric in all_metrics]).item()
+                update_metrics[metric_name] = np.mean(
+                    [metric[metric_name] for metric in all_metrics]
+                ).item()
         else:
             update_metrics = self.update(
                 input_ids,
@@ -192,12 +232,11 @@ class RLOOUpdateWorker:
                 sample_log_probs,
                 True,
                 device,
+                prompt_weights=prompt_weights,
             )
 
         return update_metrics
 
-    # `is_update_step` is False on intermediate microbatches so we can
-    # accumulate gradients before stepping optimizer/scheduler.
     def update(
         self,
         input_ids: np.ndarray,
@@ -208,8 +247,9 @@ class RLOOUpdateWorker:
         is_update_step: bool = True,
         device='cuda',
         importance_weight_clip: Optional[float] = None,
+        prompt_weights: Optional[np.ndarray] = None,
     ):
-        """One RLOO policy gradient update with leave-one-out advantage.
+        """One MaxRL policy gradient update with successful-conditional weights.
 
         Inputs are flattened over (batch, group): rows i*G..(i+1)*G belong to
         the i-th prompt's group.
@@ -225,10 +265,10 @@ class RLOOUpdateWorker:
         attention_mask_t = torch.as_tensor(attention_mask, dtype=torch.long, device=device)
         is_response_token_t = torch.as_tensor(is_response_token, dtype=torch.long, device=device)
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=device)
-        if sample_log_probs is not None:
-            sample_log_probs_t = torch.as_tensor(sample_log_probs, dtype=torch.float32, device=device)
-        else:
-            sample_log_probs_t = None
+        sample_log_probs_t = (
+            torch.as_tensor(sample_log_probs, dtype=torch.float32, device=device)
+            if sample_log_probs is not None else None
+        )
 
         N = input_ids_t.shape[0]
         G = self.group_size
@@ -257,15 +297,31 @@ class RLOOUpdateWorker:
         token_count = shift_mask.sum(dim=-1).clamp(min=1.0)  # [N]
         seq_entropy = (token_entropy * shift_mask).sum(dim=-1) / token_count  # [N]
 
-        # ---- Leave-one-out advantage ----
-        rewards_grp = rewards_t.view(B, G)
-        # baseline_i = (sum_j r_j - r_i) / (G - 1)
-        sum_r = rewards_grp.sum(dim=1, keepdim=True)
-        baseline = (sum_r - rewards_grp) / float(G - 1)
-        advantages_grp = rewards_grp - baseline  # [B, G]
-        advantages = advantages_grp.reshape(N).detach()  # [N]
+        # ---- MaxRL successful-conditional weighting ----
+        # success_i in {0,1}; per-prompt S = sum of successes within group.
+        success = (rewards_t > self.success_threshold).float()  # [N]
+        success_grp = success.view(B, G)
+        S_grp = success_grp.sum(dim=1, keepdim=True)  # [B, 1]
+        # Avoid divide-by-zero: prompts with S=0 contribute 0 (weights stay 0).
+        safe_S = S_grp.clamp(min=1.0)
+        # Weight is the importance-style 1/p_hat = G/S divided by G samples-per-prompt,
+        # giving 1/S per successful sample. Failed samples contribute 0.
+        weights_grp = success_grp / safe_S  # [B, G], sums to <=1 per group
+        # Zero out groups with no successes explicitly (keeps shape, kills signal).
+        active = (S_grp > 0).float()  # [B, 1]
+        weights_grp = weights_grp * active
+        # ---- Extension: curriculum per-prompt re-weighting ----
+        # Scale each prompt's MaxRL contribution by an optional curriculum weight
+        # in [0, 1]. Default (None) -> all-ones, leaving standard MaxRL unchanged.
+        if prompt_weights is not None:
+            pw = torch.as_tensor(prompt_weights, dtype=torch.float32, device=device).view(B, 1)
+            weights_grp = weights_grp * pw
+            curriculum_weight_mean = float(pw.mean().item())
+        else:
+            curriculum_weight_mean = 1.0
+        weights = weights_grp.reshape(N).detach()  # [N]
 
-        # ---- Importance weighting (per-sequence) ----
+        # ---- Importance weighting (per-sequence; for off-policy reuse) ----
         if sample_log_probs_t is not None:
             log_iw = (seq_logp.detach() - sample_log_probs_t)
             iw = torch.exp(log_iw)
@@ -274,16 +330,19 @@ class RLOOUpdateWorker:
             iw_mean = iw.mean().item()
             iw_max = iw.max().item()
         else:
-            iw = torch.ones_like(advantages)
+            iw = torch.ones_like(weights)
             iw_mean = 1.0
             iw_max = 1.0
 
-        # ---- Policy gradient loss ----
-        # We average over response tokens within a sequence then over sequences.
-        per_seq_logp_mean = seq_logp / token_count  # mean log-prob per response token
-        pg_loss = -(iw.detach() * advantages * per_seq_logp_mean).mean()
+        # ---- MaxRL policy gradient ----
+        # Average gradient is sum_i w_i * grad log pi(y_i|x_i) / B (per-prompt mean).
+        # Using per-token mean log-prob keeps the loss on a length-normalized scale,
+        # matching the RLOO worker's convention.
+        per_seq_logp_mean = seq_logp / token_count
+        # Divide by B so the loss magnitude is independent of group_size B*G.
+        pg_loss = -(iw.detach() * weights * per_seq_logp_mean).sum() / float(max(B, 1))
 
-        # ---- Entropy bonus (encourage exploration) ----
+        # ---- Entropy bonus (encourage exploration on noisy reward tasks) ----
         entropy_bonus = seq_entropy.mean()
         entropy_loss = -self.entropy_coefficient * entropy_bonus
 
@@ -296,7 +355,7 @@ class RLOOUpdateWorker:
                 ref_logits = ref_outputs.logits[..., :-1, :].float()
                 ref_log_probs = F.log_softmax(ref_logits, dim=-1)
                 ref_token_logp = ref_log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            # k3 estimator of KL(pi || pi_ref) at the realized tokens (positive in expectation).
+            # k3 estimator of KL(pi || pi_ref) at the realized tokens.
             log_ratio = (token_logp - ref_token_logp) * shift_mask
             kl_per_token = (log_ratio.exp() - 1.0) - log_ratio
             kl_per_seq = kl_per_token.sum(dim=-1) / token_count
@@ -316,6 +375,11 @@ class RLOOUpdateWorker:
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
+        # ---- Diagnostics ----
+        n_active_groups = float(active.sum().item())
+        active_group_frac = n_active_groups / float(max(B, 1))
+        # Per-prompt empirical success rate p_hat = S/G.
+        p_hat = (S_grp.squeeze(1) / float(G))
         metrics = {
             'loss': float(loss.detach().item()),
             'pg_loss': float(pg_loss.detach().item()),
@@ -324,8 +388,15 @@ class RLOOUpdateWorker:
             'iw_mean': float(iw_mean),
             'iw_max': float(iw_max),
             'reward_mean': float(rewards_t.mean().item()),
-            'advantage_mean': float(advantages.mean().item()),
-            'advantage_std': float(advantages.std().item()),
+            'success_rate': float(success.mean().item()),
+            'p_hat_mean': float(p_hat.mean().item()),
+            'p_hat_min': float(p_hat.min().item()),
+            'p_hat_max': float(p_hat.max().item()),
+            'active_group_frac': float(active_group_frac),
+            'curriculum_weight_mean': float(curriculum_weight_mean),
+            'weight_mean_active': float(
+                (weights.sum() / max(float(success.sum().item()), 1.0)).item()
+            ),
             'seq_logp_mean': float(seq_logp.detach().mean().item()),
             'lr': float(self.scheduler.get_last_lr()[0]) if hasattr(self, 'scheduler') else 0.0,
         }
