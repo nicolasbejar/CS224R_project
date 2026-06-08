@@ -312,7 +312,8 @@ def _make_plots(payload: dict, out_dir: str) -> None:
             marker="d", color="C3")
     ax.set_xlabel(r"verifier-judge error correlation $\rho$")
     ax.set_ylabel("final pass@1 (MaxRL + RLAIF, $p=0.1$)")
-    ax.set_title("RLAIF de-noising erodes as channel errors correlate")
+    ax.set_title("Toy bandit: RLAIF gain erodes as judge errors correlate",
+                 fontsize=11)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "toy_rlaif_correlation.png"), dpi=160)
     plt.close(fig)

@@ -233,36 +233,60 @@ def _make_plots(payload: dict, out_dir: str) -> None:
         return
 
     plt.rcParams.update({"font.size": 11, "axes.grid": True, "grid.alpha": 0.3})
+    # Only the two distinct pipelines are plotted (MaxRL verifier-only vs. the
+    # RLAIF agreement gate). The "+ curriculum" series is omitted because, for
+    # these metrics, it is either mathematically identical (spurious-prompt rate
+    # is a per-prompt binary event, independent of the curriculum's prompt
+    # weight) or visually indistinguishable (weight-normalised FP fraction).
     cond_labels = {
         "maxrl": "MaxRL (verifier only)",
-        "maxrl_rlaif": "MaxRL + RLAIF gate",
-        "maxrl_rlaif_curriculum": "MaxRL + RLAIF + curriculum",
+        "maxrl_rlaif": "MaxRL + RLAIF agreement gate",
     }
+    cond_styles = {"maxrl": "-o", "maxrl_rlaif": "--s"}
+    title = "Real Countdown rollouts \u00b7 simulated noise + judge ($q{=}0.1$)"
 
-    for metric, ylabel, fname in [
-        ("false_positive_weight_fraction",
-         "false-positive gradient-weight fraction", "offline_fp_weight_fraction.png"),
-        ("spurious_success_prompt_rate",
-         "spurious-success prompt rate", "offline_spurious_prompt_rate.png"),
-    ]:
-        fig, ax = plt.subplots(figsize=(6.2, 4.3))
-        for name, mdl in payload["models"].items():
-            res = mdl["metrics"]
-            xs = res["flip_grid"]
-            for cond, style in zip(
-                ["maxrl", "maxrl_rlaif", "maxrl_rlaif_curriculum"],
-                ["-o", "--s", ":^"],
-            ):
-                ys = [d[metric] for d in res[cond]]
-                ax.plot(xs, ys, style, label=f"{name}: {cond_labels[cond]}", alpha=0.9)
-        ax.set_xscale("symlog", linthresh=1e-3)
-        ax.set_xlabel("verifier flip probability $p$")
-        ax.set_ylabel(ylabel)
-        ax.set_title("MaxRL contamination on real Countdown rollouts")
-        ax.legend(fontsize=7, loc="upper left")
-        fig.tight_layout()
-        fig.savefig(os.path.join(out_dir, fname), dpi=160)
-        plt.close(fig)
+    # --- Figure A: false-positive gradient-weight fraction ---
+    # IPO and SFT diverge only marginally on this metric (<2 pts until p=0.2),
+    # so plotting both produced four lines that read as two near-overlapping
+    # pairs. For poster clarity we draw a single representative model and note
+    # the cross-model agreement in the caption.
+    figA, axA = plt.subplots(figsize=(6.2, 4.3))
+    repA_name, repA_mdl = next(iter(payload["models"].items()))
+    resA = repA_mdl["metrics"]
+    xsA = resA["flip_grid"]
+    for cond, color in (("maxrl", "#d62728"), ("maxrl_rlaif", "#1f77b4")):
+        ys = [d["false_positive_weight_fraction"] for d in resA[cond]]
+        axA.plot(xsA, ys, cond_styles[cond], color=color,
+                 label=cond_labels[cond], alpha=0.9)
+    axA.set_xscale("symlog", linthresh=1e-3)
+    axA.set_xlabel("verifier flip probability $p$")
+    axA.set_ylabel("false-positive gradient-weight fraction")
+    axA.set_title(title)
+    axA.legend(fontsize=9, loc="upper left")
+    figA.tight_layout()
+    figA.savefig(os.path.join(out_dir, "offline_fp_weight_fraction.png"), dpi=160)
+    plt.close(figA)
+
+    # --- Figure B: spurious-success prompt rate (model-independent) ---
+    # This metric is a per-prompt binary event driven only by the flip grid, so
+    # IPO and SFT coincide exactly. Plotting both produced a 4-entry legend with
+    # only 2 visible curves -- so here we draw a single representative pair.
+    figB, axB = plt.subplots(figsize=(6.2, 4.3))
+    rep_name, rep_mdl = next(iter(payload["models"].items()))
+    res = rep_mdl["metrics"]
+    xs = res["flip_grid"]
+    for cond, color in (("maxrl", "#d62728"), ("maxrl_rlaif", "#1f77b4")):
+        ys = [d["spurious_success_prompt_rate"] for d in res[cond]]
+        axB.plot(xs, ys, cond_styles[cond], color=color,
+                 label=cond_labels[cond], alpha=0.9)
+    axB.set_xscale("symlog", linthresh=1e-3)
+    axB.set_xlabel("verifier flip probability $p$")
+    axB.set_ylabel("spurious-success prompt rate")
+    axB.set_title(title)
+    axB.legend(fontsize=9, loc="upper left")
+    figB.tight_layout()
+    figB.savefig(os.path.join(out_dir, "offline_spurious_prompt_rate.png"), dpi=160)
+    plt.close(figB)
 
     print(f"Wrote 2 figures to {out_dir}")
 
